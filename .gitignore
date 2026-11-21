@@ -1,0 +1,20 @@
+# Visual Studio and compiler output
+.vs/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.user
+/Debug/
+/Release/
+/x64/
+/x86/
+
+# C/Migemo runtime and dictionaries installed locally
+/migemo.dll
+/migemo32.dll
+/dict/
+
+# Local prototypes and manual drop-test file
+/gomi/
+/test.txt
