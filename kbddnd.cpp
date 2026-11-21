@@ -1,5 +1,5 @@
 // Build in an x64 Visual Studio Developer Command Prompt for the x64 migemo.dll:
-// cl /nologo /std:c++17 /EHsc /utf-8 /W4 KeyboardDrop.cpp /link /SUBSYSTEM:WINDOWS
+// cl /nologo /std:c++17 /EHsc /utf-8 /W4 kbddnd.cpp /link /SUBSYSTEM:CONSOLE
 #define UNICODE
 #define _UNICODE
 #define NOMINMAX
@@ -14,6 +14,7 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <atomic>
 #include <thread>
 #include <filesystem>
@@ -28,7 +29,7 @@
 
 namespace {
 using Microsoft::WRL::ComPtr;
-constexpr wchar_t title[] = L"Keyboard Drop";
+constexpr wchar_t title[] = L"kbddnd";
 std::vector<std::wstring> paths;
 std::vector<HWND> targets;
 size_t selected = 0;
@@ -622,13 +623,15 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
 }
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+int wmain(int argc, wchar_t* argv[]) {
+    if (argc < 2) {
+        return std::puts("kbddnd 0.3.0\nUsage: kbddnd.exe FILE [FILE ...]") == EOF ? 1 : 0;
+    }
+    FreeConsole();
+    HINSTANCE instance = GetModuleHandleW(nullptr);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    int argc = 0;
-    auto argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     std::wstring error;
-    if (!argv || argc < 2) error = L"使い方: KeyboardDrop.exe ファイル [ファイル ...]";
-    for (int i = 1; argv && i < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
         std::error_code ec;
         auto path = std::filesystem::absolute(argv[i], ec);
         if (ec || !std::filesystem::exists(path, ec)) {
@@ -637,7 +640,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
         paths.push_back(path.wstring());
     }
-    LocalFree(argv);
     if (!error.empty()) {
         MessageBoxW(nullptr, error.c_str(), title, MB_ICONINFORMATION);
         return 1;
@@ -647,7 +649,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     cls.hInstance = instance;
     cls.lpfnWndProc = procedure;
     cls.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    cls.lpszClassName = L"KeyboardDropSelector";
+    cls.lpszClassName = L"kbddndSelector";
     if (RegisterClassW(&cls))
         overlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
             cls.lpszClassName, title, WS_POPUP, GetSystemMetrics(SM_XVIRTUALSCREEN),

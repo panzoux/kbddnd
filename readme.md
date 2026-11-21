@@ -1,4 +1,4 @@
-# Keyboard Drop
+# kbddnd
 
 Windowsで、コマンドラインから指定したファイルを、キーボードで選んだウィンドウにドラッグ＆ドロップするツールです。Migemoによるローマ字検索でウィンドウを絞り込み、部品や画面上の位置を指定して送信できます。
 
@@ -7,15 +7,15 @@ Windowsで、コマンドラインから指定したファイルを、キーボ�
 Visual Studio 2022のC++ビルドツールとWindows SDKを用意し、**x64 Native Tools Command Prompt** でリポジトリのルートから実行します。
 
 ```bat
-cl /nologo /std:c++17 /EHsc /utf-8 /W4 KeyboardDrop.cpp /link /SUBSYSTEM:WINDOWS
-KeyboardDrop.exe "C:\work\画像 1.png" "C:\work\資料.txt"
+cl /nologo /std:c++17 /EHsc /utf-8 /W4 kbddnd.cpp /link /SUBSYSTEM:CONSOLE
+kbddnd.exe "C:\work\画像 1.png" "C:\work\資料.txt"
 ```
 
-ファイルは1件から指定できます。相対パスは起動時の作業ディレクトリを基準に解決します。ビルドと通常の文字列検索にはC/Migemoは不要です。
+引数なしで `kbddnd.exe` を実行すると、標準出力にバージョンと使い方を表示して終了します。ファイルは1件から指定できます。相対パスは起動時の作業ディレクトリを基準に解決します。ビルドと通常の文字列検索にはC/Migemoは不要です。
 
 ## ローマ字検索を有効にする
 
-64ビット版では、C/Migemoの `migemo.dll` を `KeyboardDrop.exe` の隣に置き、CP932版の辞書と変換表を `dict\` に置きます。以下のPowerShellコマンドを実行ファイルのあるフォルダーで実行してください。使用するのはC/MigemoプロジェクトのWindows x64向け20110227版です。[C/Migemo公式サイト](https://www.kaoriya.net/software/cmigemo/)
+64ビット版では、C/Migemoの `migemo.dll` を `kbddnd.exe` の隣に置き、CP932版の辞書と変換表を `dict\` に置きます。以下のPowerShellコマンドを実行ファイルのあるフォルダーで実行してください。使用するのはC/MigemoプロジェクトのWindows x64向け20110227版です。[C/Migemo公式サイト](https://www.kaoriya.net/software/cmigemo/)
 
 ```powershell
 $work = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ([guid]::NewGuid().ToString()))
@@ -32,7 +32,7 @@ New-Item -ItemType Directory -Force -Path .\dict | Out-Null
 Copy-Item -Path (Join-Path $src 'dict\cp932\*') -Destination .\dict -ErrorAction Stop
 ```
 
-配置後にKeyboard Dropを起動し、タイトルに「設定」を含むウィンドウが `settei` で見つかれば導入完了です。32ビットビルドにはWin32版のDLLを `migemo32.dll` という名前で配置します。
+配置後にkbddndを起動し、タイトルに「設定」を含むウィンドウが `settei` で見つかれば導入完了です。32ビットビルドにはWin32版のDLLを `migemo32.dll` という名前で配置します。
 
 ## 操作
 
