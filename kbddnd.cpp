@@ -29,6 +29,7 @@
 
 namespace {
 using Microsoft::WRL::ComPtr;
+constexpr COLORREF transparentColor = RGB(255, 0, 255);
 constexpr wchar_t title[] = L"kbddnd";
 std::vector<std::wstring> paths;
 std::vector<HWND> targets;
@@ -208,13 +209,21 @@ public:
     }
 } windowSearch;
 
-std::wstring windowName(HWND w) {
+std::wstring windowCaption(HWND w) {
     std::wstring name(static_cast<size_t>(GetWindowTextLengthW(w)) + 1, 0);
     name.resize(GetWindowTextW(w, name.data(), static_cast<int>(name.size())));
-    if (!name.empty()) return name;
+    return name;
+}
+
+std::wstring windowClass(HWND w) {
     wchar_t cls[256]{};
     GetClassNameW(w, cls, ARRAYSIZE(cls));
     return cls;
+}
+
+std::wstring windowName(HWND w) {
+    auto name = windowCaption(w);
+    return name.empty() ? windowClass(w) : name;
 }
 
 bool matchesWindow(HWND w) {
@@ -230,15 +239,28 @@ bool matchesWindow(HWND w) {
     return ok && windowSearch.matches(std::filesystem::path(path).stem().wstring());
 }
 
-void refresh() {
+// Keep existing candidates in display order even if their Z-order changes.
+void updateTargets(const std::vector<HWND>& found) {
     HWND previous = targets.empty() ? nullptr : targets[selected];
-    targets.clear();
-    EnumWindows([](HWND w, LPARAM) -> BOOL {
-        if (candidate(w) && matchesWindow(w)) targets.push_back(w);
-        return TRUE;
-    }, 0);
+    targets.erase(std::remove_if(targets.begin(), targets.end(), [&](HWND w) {
+        return std::find(found.begin(), found.end(), w) == found.end();
+    }), targets.end());
+    for (HWND w : found) {
+        if (std::find(targets.begin(), targets.end(), w) == targets.end())
+            targets.push_back(w);
+    }
     auto pos = std::find(targets.begin(), targets.end(), previous);
     selected = pos == targets.end() ? 0 : static_cast<size_t>(pos - targets.begin());
+}
+
+void refresh() {
+    std::vector<HWND> found;
+    EnumWindows([](HWND w, LPARAM arg) -> BOOL {
+        if (candidate(w) && matchesWindow(w))
+            reinterpret_cast<std::vector<HWND>*>(arg)->push_back(w);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&found));
+    updateTargets(found);
 }
 
 void paint(HWND w) {
@@ -246,9 +268,11 @@ void paint(HWND w) {
     HDC dc = BeginPaint(w, &ps);
     RECT canvas{};
     GetClientRect(w, &canvas);
-    FillRect(dc, &canvas, GetSysColorBrush(COLOR_WINDOWTEXT));
+    SetDCBrushColor(dc, transparentColor);
+    HBRUSH fill = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
+    FillRect(dc, &canvas, fill);
     RECT r{};
-    std::wstring label = L"対象ウィンドウがありません";
+    std::wstring label = L"対象 (0/0)";
     if (!targets.empty() && GetWindowRect(targets[selected], &r)) {
         MapWindowPoints(nullptr, w, reinterpret_cast<POINT*>(&r), 2);
         HBRUSH brush = CreateSolidBrush(RGB(0, 220, 255));
@@ -257,12 +281,15 @@ void paint(HWND w) {
             InflateRect(&r, -1, -1);
         }
         DeleteObject(brush);
-        label = std::to_wstring(selected + 1) + L"/" + std::to_wstring(targets.size()) + L"  " + windowName(targets[selected]);
+        label = L"対象 (" + std::to_wstring(selected + 1) + L"/" + std::to_wstring(targets.size()) + L")  " + windowName(targets[selected]);
     }
     if (!targets.empty()) {
         HWND root = targets[selected];
         if (mode == Mode::part) {
-            RECT bounds = visiblePart(parts[partIndex], root);
+            HWND part = parts[partIndex];
+            RECT bounds = visiblePart(part, root);
+            POINT center = midpoint(bounds);
+            bool hasPosition = !IsRectEmpty(&bounds) && ScreenToClient(root, &center);
             MapWindowPoints(nullptr, w, reinterpret_cast<POINT*>(&bounds), 2);
             HBRUSH brush = CreateSolidBrush(RGB(255, 190, 32));
             for (int i = 0; i < 3; ++i) {
@@ -270,7 +297,13 @@ void paint(HWND w) {
                 InflateRect(&bounds, -1, -1);
             }
             DeleteObject(brush);
-            label += L"  部品 " + std::to_wstring(partIndex+1) + L"/" + std::to_wstring(parts.size());
+            label = L"部品 (" + std::to_wstring(partIndex + 1) + L"/" + std::to_wstring(parts.size()) + L")";
+            if (hasPosition)
+                label += L" (" + std::to_wstring(center.x) + L", " + std::to_wstring(center.y) + L")";
+            auto cls = windowClass(part);
+            auto caption = windowCaption(part);
+            if (!cls.empty()) label += L" [" + cls + L"]";
+            if (!caption.empty() && caption != cls) label += L" " + caption;
         }
         POINT at{};
         if (aim(root, at)) {
@@ -285,10 +318,17 @@ void paint(HWND w) {
         if (mode == Mode::position)
             label += L"  位置 (" + std::to_wstring(manual.x) + L", " + std::to_wstring(manual.y) + L")";
     }
-    if (!searchText.empty()) label = (windowSearch.available() ? L"検索「" : L"文字列検索「") + searchText +
-                                     L"」  " + (targets.empty() ? L"候補 0 件" : label);
-    if (!notice.empty()) label = notice + L"  |  " + label;
-    SetWindowTextW(w, (std::wstring(title) + L" — " + label).c_str());
+    const wchar_t* modeName = L"ウィンドウ選択";
+    const wchar_t* keys = L"←→ 選択  Tab 部品  Enter 送信  Esc 戻る";
+    if (mode == Mode::part) {
+        modeName = L"部品選択";
+        keys = L"矢印 選択  Tab 位置  Enter 送信  Esc 戻る";
+    } else if (mode == Mode::position) {
+        modeName = L"位置選択";
+        keys = L"矢印 移動  Ctrl 高速  Shift 1px  Enter 送信  Esc 戻る";
+    }
+    std::wstring heading = std::wstring(title) + L" [" + modeName + L"] " + searchText;
+    SetWindowTextW(w, (heading + L" — " + label).c_str());
     MONITORINFO mi{sizeof(MONITORINFO), {}, {}, 0};
     GetMonitorInfoW(MonitorFromWindow(targets.empty() ? nullptr : targets[selected],
                                       MONITOR_DEFAULTTOPRIMARY), &mi);
@@ -296,18 +336,39 @@ void paint(HWND w) {
     MapWindowPoints(nullptr, w, reinterpret_cast<POINT*>(&panel), 2);
     InflateRect(&panel, -16, -16);
     LONG bottom = panel.bottom;
-    panel.bottom = panel.top + 48;
+    panel.bottom = panel.top + 48 + (notice.empty() ? 0 : 32);
     POINT marker{};
     if (!targets.empty() && aim(targets[selected], marker) && ScreenToClient(w, &marker) && PtInRect(&panel, marker))
         OffsetRect(&panel, 0, bottom - panel.bottom);
-    FillRect(dc, &panel, GetSysColorBrush(COLOR_HIGHLIGHT));
-    SetTextColor(dc, GetSysColor(COLOR_HIGHLIGHTTEXT));
+    RECT bar = panel;
+    bar.bottom = bar.top + 48;
+    SetDCBrushColor(dc, RGB(0, 91, 165));
+    FillRect(dc, &bar, fill);
+    SetTextColor(dc, RGB(255, 255, 255));
     SetBkMode(dc, TRANSPARENT);
-    const wchar_t* keys = L"文字入力で検索   ← → 選択   Space 部品   Enter 送信   Esc 戻る";
-    if (mode == Mode::part) keys = L"方向キー 部品選択   Tab 位置指定   Enter 送信   Esc 戻る";
-    if (mode == Mode::position) keys = L"方向キー 移動   Ctrl 高速   Shift 1px   Enter 送信   Esc 戻る";
-    label = std::wstring(keys) + L"  |  " + label;
-    DrawTextW(dc, label.c_str(), -1, &panel, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    const UINT flags = DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
+    InflateRect(&bar, -8, 0);
+    LONG width = bar.right - bar.left;
+    RECT keySize{};
+    DrawTextW(dc, keys, -1, &keySize, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    LONG sideWidth = std::clamp(keySize.right + 8, width / 4, width * 3 / 8);
+    RECT left = bar, center = bar, right = bar;
+    left.right = bar.left + sideWidth;
+    right.left = bar.right - sideWidth;
+    center.left = left.right + 4;
+    center.right = right.left - 4;
+    DrawTextW(dc, heading.c_str(), -1, &left, flags | DT_LEFT);
+    DrawTextW(dc, label.c_str(), -1, &center, flags | DT_CENTER);
+    DrawTextW(dc, keys, -1, &right, flags | DT_RIGHT);
+    if (!notice.empty()) {
+        RECT message = panel;
+        message.top = bar.bottom;
+        SetDCBrushColor(dc, RGB(255, 246, 190));
+        FillRect(dc, &message, fill);
+        InflateRect(&message, -8, 0);
+        SetTextColor(dc, RGB(0, 0, 0));
+        DrawTextW(dc, notice.c_str(), -1, &message, flags | DT_LEFT);
+    }
     EndPaint(w, &ps);
 }
 
@@ -356,12 +417,16 @@ std::wstring deliver(HWND target, POINT center, HWND expectedPart) {
     RECT bounds = clientOnScreen(target);
     if (!candidate(target) || !PtInRect(&bounds, center))
         return L"送信位置が変わりました。選び直してください。";
-    // Keep the selector active while placing the receiver under the drop point.
-    HWND insertAfter = (GetWindowLongPtrW(target, GWL_EXSTYLE) & WS_EX_TOPMOST) ? overlay : HWND_TOP;
-    SetWindowPos(target, insertAfter, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     HWND hit = WindowFromPoint(center);
-    if (GetAncestor(hit, GA_ROOT) != target)
-        return L"指定位置が隠れています。対象を手前に表示してください。";
+    if (GetAncestor(hit, GA_ROOT) != target) {
+        SetForegroundWindow(target);
+        SetWindowPos(target, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        if (!candidate(target) || !aim(target, center))
+            return L"送信位置が変わりました。選び直してください。";
+        hit = WindowFromPoint(center);
+        if (GetAncestor(hit, GA_ROOT) != target)
+            return L"対象を前面に表示しても送信位置を確認できません。";
+    }
     if (expectedPart && hit != expectedPart && !IsChild(expectedPart, hit))
         return L"選んだ部品が隠れています。位置を選び直してください。";
 
@@ -482,6 +547,10 @@ void restoreSelectorFocus(HWND w) {
 }
 
 LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && !dropping && !notice.empty()) {
+        notice.clear();
+        InvalidateRect(w, nullptr, FALSE);
+    }
     switch (msg) {
     case WM_PAINT: paint(w); return 0;
     case WM_TIMER:
@@ -493,9 +562,8 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
     case WM_CHAR:
         if (dropping || mode != Mode::window) return 0;
         if (key == 0x15) searchText.clear(); // Ctrl+U
-        else if (key > L' ' && key != 0x7f) searchText.push_back(static_cast<wchar_t>(key));
+        else if (key >= L' ' && key != 0x7f) searchText.push_back(static_cast<wchar_t>(key));
         else return 0;
-        notice.clear();
         windowSearch.compile();
         refresh();
         InvalidateRect(w, nullptr, FALSE);
@@ -508,7 +576,6 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
             searchText.pop_back();
             if (IS_LOW_SURROGATE(last) && !searchText.empty() && IS_HIGH_SURROGATE(searchText.back()))
                 searchText.pop_back();
-            notice.clear();
             windowSearch.compile();
             refresh();
             InvalidateRect(w, nullptr, FALSE);
@@ -517,23 +584,21 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
         // Ignore repeats from an Enter press that began in the launching console.
         if (key == VK_RETURN && !(lp & (1L << 30))) enterPressedHere = true;
         if (key == VK_RETURN) return 0;
-        if ((key == VK_ESCAPE || key == VK_SPACE || key == VK_TAB) && (lp & (1L << 30))) return 0;
+        if ((key == VK_ESCAPE || key == VK_TAB) && (lp & (1L << 30))) return 0;
         if (key == VK_ESCAPE) {
-            notice.clear();
             if (mode == Mode::window) {
                 if (searchText.empty()) DestroyWindow(w);
                 else SendMessageW(w, WM_CHAR, 0x15, 0);
                 return 0;
             }
             mode = mode == Mode::position && !parts.empty() ? Mode::part : Mode::window;
-        } else if (key == VK_SPACE && mode == Mode::window && !targets.empty()) {
+        } else if (key == VK_TAB && mode == Mode::window && !targets.empty()) {
             HWND root = targets[selected];
             // Reveal the target under the overlay while keeping keyboard focus.
             SetWindowPos(root, HWND_TOP, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
             SetWindowPos(w, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             findParts(root);
-            notice.clear();
             if (parts.empty()) {
                 RECT r{};
                 GetClientRect(root, &r);
@@ -548,11 +613,9 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
             ScreenToClient(root, &pos);
             manual = pos;
             mode = Mode::position;
-            notice.clear();
         } else if (key >= VK_LEFT && key <= VK_DOWN) {
             int dx = (key == VK_RIGHT) - (key == VK_LEFT);
             int dy = (key == VK_DOWN) - (key == VK_UP);
-            notice.clear();
             if (mode == Mode::window && dx) {
                 refresh();
                 if (!targets.empty())
@@ -603,7 +666,7 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
             else {
                 notice = error;
                 if (!candidate(target)) { mode = Mode::window; parts.clear(); refresh(); }
-                SetLayeredWindowAttributes(w, GetSysColor(COLOR_WINDOWTEXT), 220, LWA_COLORKEY | LWA_ALPHA);
+                SetLayeredWindowAttributes(w, transparentColor, 220, LWA_COLORKEY | LWA_ALPHA);
                 rejectedTarget = target;
                 taskbarPreview = isTaskbar(target) ? GetForegroundWindow() : nullptr;
                 LASTINPUTINFO input{sizeof(input), 0};
@@ -625,7 +688,7 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
-        return std::puts("kbddnd 0.3.0\nUsage: kbddnd.exe FILE [FILE ...]") == EOF ? 1 : 0;
+        return std::puts("kbddnd 0.3.3\nUsage: kbddnd.exe FILE [FILE ...]") == EOF ? 1 : 0;
     }
     FreeConsole();
     HINSTANCE instance = GetModuleHandleW(nullptr);
@@ -656,7 +719,7 @@ int wmain(int argc, wchar_t* argv[]) {
             GetSystemMetrics(SM_YVIRTUALSCREEN), GetSystemMetrics(SM_CXVIRTUALSCREEN),
             GetSystemMetrics(SM_CYVIRTUALSCREEN), nullptr, nullptr, instance, nullptr);
     int result = 1;
-    if (overlay && SetLayeredWindowAttributes(overlay, GetSysColor(COLOR_WINDOWTEXT), 220, LWA_COLORKEY | LWA_ALPHA)) {
+    if (overlay && SetLayeredWindowAttributes(overlay, transparentColor, 220, LWA_COLORKEY | LWA_ALPHA)) {
         refresh();
         ShowWindow(overlay, SW_SHOW);
         SetForegroundWindow(overlay);
