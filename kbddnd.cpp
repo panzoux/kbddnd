@@ -30,6 +30,8 @@
 namespace {
 using Microsoft::WRL::ComPtr;
 constexpr COLORREF transparentColor = RGB(255, 0, 255);
+constexpr wchar_t version[] = L"0.5.0";
+bool helpVisible = false;
 constexpr wchar_t title[] = L"kbddnd";
 std::vector<std::wstring> paths;
 std::wstring fileSummary;
@@ -348,7 +350,8 @@ void paint(HWND w) {
     HBRUSH fill = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
     FillRect(dc, &canvas, fill);
     RECT r{};
-    std::wstring label = L"対象 (0/0)";
+    std::wstring label = L"No matching windows";
+    std::wstring badge = L"Window (" + std::to_wstring(targets.empty() ? 0 : selected + 1) + L"/" + std::to_wstring(targets.size()) + L")";
     if (!targets.empty() && GetWindowRect(targets[selected], &r)) {
         MapWindowPoints(nullptr, w, reinterpret_cast<POINT*>(&r), 2);
         HBRUSH brush = CreateSolidBrush(RGB(0, 220, 255));
@@ -357,7 +360,7 @@ void paint(HWND w) {
             InflateRect(&r, -1, -1);
         }
         DeleteObject(brush);
-        label = L"対象 (" + std::to_wstring(selected + 1) + L"/" + std::to_wstring(targets.size()) + L")  " + windowName(targets[selected]);
+        label = L"[" + windowName(targets[selected]) + L"]";
     }
     if (!targets.empty()) {
         HWND root = targets[selected];
@@ -373,13 +376,13 @@ void paint(HWND w) {
                 InflateRect(&bounds, -1, -1);
             }
             DeleteObject(brush);
-            label = L"部品 (" + std::to_wstring(partIndex + 1) + L"/" + std::to_wstring(parts.size()) + L")";
-            if (hasPosition)
-                label += L" (" + std::to_wstring(center.x) + L", " + std::to_wstring(center.y) + L")";
+            badge = L"Part (" + std::to_wstring(partIndex + 1) + L"/" + std::to_wstring(parts.size()) + L")";
             auto cls = windowClass(part);
             auto caption = windowCaption(part);
-            if (!cls.empty()) label += L" [" + cls + L"]";
-            if (!caption.empty() && caption != cls) label += L" " + caption;
+            label = L"[" + (caption.empty() ? cls : caption) + L"]";
+            if (!caption.empty() && caption != cls) label += L"  " + cls;
+            if (hasPosition)
+                label += L"  (" + std::to_wstring(center.x) + L", " + std::to_wstring(center.y) + L")";
         }
         POINT at{};
         if (aim(root, at)) {
@@ -391,20 +394,27 @@ void paint(HWND w) {
             FillRect(dc, &v, brush);
             DeleteObject(brush);
         }
-        if (mode == Mode::position)
-            label += L"  位置 (" + std::to_wstring(manual.x) + L", " + std::to_wstring(manual.y) + L")";
+        if (mode == Mode::position) {
+            badge = L"Position";
+            label += L"  (" + std::to_wstring(manual.x) + L", " + std::to_wstring(manual.y) + L")";
+        }
     }
-    const wchar_t* modeName = L"ウィンドウ選択";
-    const wchar_t* keys = L"←→ 選択  Tab 部品  Enter 送信  Esc 戻る";
-    if (mode == Mode::part) {
-        modeName = L"部品選択";
-        keys = L"矢印 選択  Tab 位置  Enter 送信  Esc 戻る";
-    } else if (mode == Mode::position) {
-        modeName = L"位置選択";
-        keys = L"矢印 移動  Ctrl 高速  Shift 1px  Enter 送信  Esc 戻る";
+    bool searching = mode == Mode::window && !searchText.empty();
+    std::wstring keys = mode == Mode::window ? L"?:help  Esc:quit" : L"?:help  Esc:back";
+    keys += std::wstring(L"  |  kbddnd v") + version;
+    std::wstring guide;
+    if (helpVisible) {
+        if (mode == Mode::window) {
+            guide = L"Keys: Left/Right select window    Tab select part    Enter drop    ";
+            if (searching) guide += L"Ctrl+U/K clear search    ";
+            guide += L"Esc quit";
+        } else if (mode == Mode::part) {
+            guide = L"Keys: Arrow keys select part    Tab select position    Enter drop    Shift+Tab/Esc back";
+        } else {
+            guide = L"Keys: Arrow keys move    Ctrl fast    Shift 1px    Enter drop    Shift+Tab/Esc back";
+        }
     }
-    std::wstring heading = std::wstring(title) + L" [" + modeName + L"] " + searchText;
-    SetWindowTextW(w, (heading + L" — " + label).c_str());
+    SetWindowTextW(w, (badge + L" — " + label).c_str());
     MONITORINFO mi{sizeof(MONITORINFO), {}, {}, 0};
     GetMonitorInfoW(MonitorFromWindow(targets.empty() ? nullptr : targets[selected],
                                       MONITOR_DEFAULTTOPRIMARY), &mi);
@@ -412,7 +422,7 @@ void paint(HWND w) {
     MapWindowPoints(nullptr, w, reinterpret_cast<POINT*>(&panel), 2);
     InflateRect(&panel, -16, -16);
     LONG bottom = panel.bottom;
-    panel.bottom = panel.top + 48 + 32 + (notice.empty() ? 0 : 32);
+    panel.bottom = panel.top + 48 + 32 + (searching ? 32 : 0) + (helpVisible || !notice.empty() ? 32 : 0);
     POINT marker{};
     if (!targets.empty() && aim(targets[selected], marker) && ScreenToClient(w, &marker) && PtInRect(&panel, marker))
         OffsetRect(&panel, 0, bottom - panel.bottom);
@@ -423,19 +433,24 @@ void paint(HWND w) {
     SetTextColor(dc, RGB(255, 255, 255));
     SetBkMode(dc, TRANSPARENT);
     const UINT flags = DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
-    InflateRect(&bar, -8, 0);
+    SIZE badgeSize{}, keysSize{};
+    GetTextExtentPoint32W(dc, badge.c_str(), static_cast<int>(badge.size()), &badgeSize);
+    GetTextExtentPoint32W(dc, keys.c_str(), static_cast<int>(keys.size()), &keysSize);
     LONG width = bar.right - bar.left;
-    RECT keySize{};
-    DrawTextW(dc, keys, -1, &keySize, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
-    LONG sideWidth = std::clamp(keySize.right + 8, width / 4, width * 3 / 8);
     RECT left = bar, center = bar, right = bar;
-    left.right = bar.left + sideWidth;
-    right.left = bar.right - sideWidth;
-    center.left = left.right + 4;
-    center.right = right.left - 4;
-    DrawTextW(dc, heading.c_str(), -1, &left, flags | DT_LEFT);
+    left.right = left.left + std::min(width / 3, badgeSize.cx + 20);
+    right.left = right.right - std::min(width / 2, keysSize.cx + 16);
+    LONG inset = std::max(left.right - bar.left, bar.right - right.left);
+    center.left += std::min(inset, width / 3);
+    center.right = right.left;
+    SetDCBrushColor(dc, RGB(0, 220, 255));
+    FillRect(dc, &left, fill);
+    SetTextColor(dc, RGB(8, 30, 42));
+    DrawTextW(dc, badge.c_str(), -1, &left, flags | DT_CENTER);
+    SetTextColor(dc, RGB(255, 255, 255));
     DrawTextW(dc, label.c_str(), -1, &center, flags | DT_CENTER);
-    DrawTextW(dc, keys, -1, &right, flags | DT_RIGHT);
+    InflateRect(&right, -6, 0);
+    DrawTextW(dc, keys.c_str(), -1, &right, flags | DT_RIGHT);
     RECT files = panel;
     files.top = bar.bottom;
     files.bottom = files.top + 32;
@@ -444,14 +459,35 @@ void paint(HWND w) {
     InflateRect(&files, -8, 0);
     SetTextColor(dc, RGB(18, 43, 64));
     DrawTextW(dc, fileSummary.c_str(), -1, &files, flags | DT_LEFT);
-    if (!notice.empty()) {
-        RECT message = panel;
-        message.top = files.bottom;
-        SetDCBrushColor(dc, RGB(255, 246, 190));
-        FillRect(dc, &message, fill);
-        InflateRect(&message, -8, 0);
+    RECT row = panel;
+    row.top = files.bottom;
+    if (searching) {
+        row.bottom = row.top + 32;
+        SetDCBrushColor(dc, RGB(18, 52, 82));
+        FillRect(dc, &row, fill);
+        RECT query = row;
+        InflateRect(&query, -8, 0);
+        SetTextColor(dc, RGB(255, 255, 255));
+        DrawTextW(dc, L"search: ", -1, &query, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        SIZE prefix{}, term{};
+        GetTextExtentPoint32W(dc, L"search: ", 8, &prefix);
+        GetTextExtentPoint32W(dc, searchText.c_str(), static_cast<int>(searchText.size()), &term);
+        query.left += prefix.cx;
+        query.right -= 2;
+        UINT align = term.cx > query.right - query.left ? DT_RIGHT : DT_LEFT;
+        DrawTextW(dc, searchText.c_str(), -1, &query, DT_NOPREFIX | DT_SINGLELINE | DT_VCENTER | align);
+        LONG x = std::min(query.left + term.cx, query.right);
+        RECT caret{x, (query.top + query.bottom - term.cy) / 2, x + 2, (query.top + query.bottom + term.cy) / 2};
+        FillRect(dc, &caret, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+        row.top = row.bottom;
+    }
+    if (helpVisible || !notice.empty()) {
+        row.bottom = row.top + 32;
+        SetDCBrushColor(dc, helpVisible ? RGB(255, 255, 255) : RGB(255, 246, 190));
+        FillRect(dc, &row, fill);
+        InflateRect(&row, -8, 0);
         SetTextColor(dc, RGB(0, 0, 0));
-        DrawTextW(dc, notice.c_str(), -1, &message, flags | DT_LEFT);
+        DrawTextW(dc, helpVisible ? guide.c_str() : notice.c_str(), -1, &row, flags | DT_LEFT);
     }
     EndPaint(w, &ps);
 }
@@ -500,19 +536,19 @@ public:
 std::wstring deliver(HWND target, POINT center, HWND expectedPart) {
     RECT bounds = clientOnScreen(target);
     if (!candidate(target) || !PtInRect(&bounds, center))
-        return L"送信位置が変わりました。選び直してください。";
+        return L"Drop position changed. Select it again.";
     HWND hit = WindowFromPoint(center);
     if (GetAncestor(hit, GA_ROOT) != target) {
         SetForegroundWindow(target);
         SetWindowPos(target, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         if (!candidate(target) || !aim(target, center))
-            return L"送信位置が変わりました。選び直してください。";
+            return L"Drop position changed. Select it again.";
         hit = WindowFromPoint(center);
         if (GetAncestor(hit, GA_ROOT) != target)
-            return L"対象を前面に表示しても送信位置を確認できません。";
+            return L"Drop position is still covered. Select another position.";
     }
     if (expectedPart && hit != expectedPart && !IsChild(expectedPart, hit))
-        return L"選んだ部品が隠れています。位置を選び直してください。";
+        return L"Selected part is covered. Select another position.";
 
     for (HWND w = hit; w; w = GetAncestor(w, GA_PARENT)) {
         if (oleHint(w)) break;
@@ -523,7 +559,7 @@ std::wstring deliver(HWND target, POINT center, HWND expectedPart) {
             auto* header = static_cast<DROPFILES*>(GlobalLock(block));
             if (!header) {
                 GlobalFree(block);
-                return L"ファイル一覧のメモリを確保できません。";
+                return L"Not enough memory for the file list.";
             }
             header->pFiles = sizeof(DROPFILES);
             header->fWide = TRUE;
@@ -538,7 +574,7 @@ std::wstring deliver(HWND target, POINT center, HWND expectedPart) {
             if (PostMessageW(w, WM_DROPFILES, reinterpret_cast<WPARAM>(block), 0))
                 return {}; // Windows marshals the posted HDROP. The receiver calls DragFinish.
             GlobalFree(block);
-            return L"対象ウィンドウに送信できませんでした。";
+            return L"Could not send the selection to the target window.";
         }
         if (w == target) break;
     }
@@ -557,10 +593,10 @@ std::wstring deliver(HWND target, POINT center, HWND expectedPart) {
     for (auto item : items) CoTaskMemFree(const_cast<PIDLIST_ABSOLUTE>(item));
     ComPtr<IDataObject> data;
     if (SUCCEEDED(hr)) hr = array->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data));
-    if (FAILED(hr)) return L"ファイルのドロップデータを作成できません。";
+    if (FAILED(hr)) return L"Could not prepare the selection for dropping.";
     POINT saved{};
     if (!GetCursorPos(&saved) || !SetCursorPos(center.x, center.y))
-        return L"指定位置にポインターを移動できません。";
+        return L"Could not move the pointer to the drop position.";
     ComPtr<IDropSource> source;
     source.Attach(new DropSource(target, center));
     DWORD effect = 0;
@@ -589,7 +625,7 @@ std::wstring deliver(HWND target, POINT center, HWND expectedPart) {
     if (GetCursorPos(&now) && now.x == center.x && now.y == center.y)
         SetCursorPos(saved.x, saved.y);
     if (hr == DRAGDROP_S_DROP && (effect & DROPEFFECT_COPY)) return {};
-    return L"選択した位置でファイルが受け付けられなかったか、操作が中断されました。";
+    return L"Drop declined or canceled. Select another position or try again.";
 }
 
 // Explorer can activate the taskbar during a drag or just after OLE unwinds.
@@ -657,8 +693,17 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
         enterPressedHere = false;
         return 0;
     case WM_CHAR:
-        if (dropping || mode != Mode::window) return 0;
-        if (key == 0x15) searchText.clear(); // Ctrl+U
+        if (dropping) return 0;
+        if (key == L'?') {
+            if (!(lp & (1L << 30))) {
+                notice.clear();
+                helpVisible = true;
+                InvalidateRect(w, nullptr, FALSE);
+            }
+            return 0;
+        }
+        if (helpVisible || mode != Mode::window) return 0;
+        if (key == 0x15 || key == 0x0b) searchText.clear(); // Ctrl+U or Ctrl+K
         else if (key >= L' ' && key != 0x7f) searchText.push_back(static_cast<wchar_t>(key));
         else return 0;
         windowSearch.compile();
@@ -682,10 +727,9 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
         if (key == VK_RETURN && !(lp & (1L << 30))) enterPressedHere = true;
         if (key == VK_RETURN) return 0;
         if ((key == VK_ESCAPE || key == VK_TAB) && (lp & (1L << 30))) return 0;
-        if (key == VK_ESCAPE) {
+        if (key == VK_ESCAPE || (key == VK_TAB && GetKeyState(VK_SHIFT) < 0)) {
             if (mode == Mode::window) {
-                if (searchText.empty()) DestroyWindow(w);
-                else SendMessageW(w, WM_CHAR, 0x15, 0);
+                if (key == VK_ESCAPE) DestroyWindow(w);
                 return 0;
             }
             mode = mode == Mode::position && !parts.empty() ? Mode::part : Mode::window;
@@ -697,7 +741,7 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
                 GetClientRect(root, &r);
                 manual = midpoint(r);
                 mode = Mode::position;
-                notice = L"部品を検出できません。位置を指定してください。";
+                notice = L"No parts found. Use arrow keys to position the drop.";
             } else mode = Mode::part;
         } else if (key == VK_TAB && mode == Mode::part) {
             HWND root = targets[selected];
@@ -745,9 +789,9 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
             // Zero alpha makes a layered window pass hit testing through while
             // keeping its keyboard focus. Hiding it hands activation to another app.
             std::wstring error;
-            if (!valid) error = L"対象の位置が変わりました。選び直してください。";
+            if (!valid) error = L"Target position changed. Select it again.";
             else if (!SetLayeredWindowAttributes(w, 0, 0, LWA_ALPHA))
-                error = L"オーバーレイを透明にできませんでした。";
+                error = L"Could not hide the overlay for the drop.";
             else {
                 // Taskbar hover can activate the app under an icon before OLE
                 // reports rejection. Keep the foreground during this keyboard drag.
@@ -782,7 +826,7 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
-        return std::puts("kbddnd 0.4.0\nUsage: kbddnd.exe FILE [FILE ...]") == EOF ? 1 : 0;
+        return std::wprintf(L"kbddnd %ls\nUsage: kbddnd.exe PATH [PATH ...]\n", version) < 0 ? 1 : 0;
     }
     FreeConsole();
     HINSTANCE instance = GetModuleHandleW(nullptr);
@@ -792,7 +836,7 @@ int wmain(int argc, wchar_t* argv[]) {
         std::error_code ec;
         auto path = std::filesystem::absolute(argv[i], ec);
         if (ec || !std::filesystem::exists(path, ec)) {
-            error = std::wstring(L"ファイルを確認できません。\n") + argv[i];
+            error = std::wstring(L"Path unavailable.\n") + argv[i];
             break;
         }
         paths.push_back(path.wstring());
@@ -801,12 +845,26 @@ int wmain(int argc, wchar_t* argv[]) {
         MessageBoxW(nullptr, error.c_str(), title, MB_ICONINFORMATION);
         return 1;
     }
-    fileSummary = L"送信 (" + std::to_wstring(paths.size()) + L"件)";
+    std::wstring items;
+    size_t directories = 0;
     for (const auto& value : paths) {
         auto path = std::filesystem::path(value).lexically_normal();
         if (!path.has_filename() && path != path.root_path()) path = path.parent_path();
-        fileSummary += L"　" + (path.has_filename() ? path.filename() : path).wstring();
+        auto name = (path.has_filename() ? path.filename() : path).wstring();
+        std::error_code ec;
+        if (std::filesystem::is_directory(value, ec)) {
+            ++directories;
+            if (name.back() != L'\\') name += L'\\';
+        }
+        if (!items.empty()) items += L" | ";
+        items += name;
     }
+    size_t files = paths.size() - directories;
+    fileSummary = L"(";
+    if (directories) fileSummary += std::to_wstring(directories) + (directories == 1 ? L" directory" : L" directories");
+    if (directories && files) fileSummary += L", ";
+    if (files) fileSummary += std::to_wstring(files) + (files == 1 ? L" file" : L" files");
+    fileSummary += L")  " + items;
     if (FAILED(OleInitialize(nullptr))) return 1;
     WNDCLASSW cls{};
     cls.hInstance = instance;
@@ -829,8 +887,24 @@ int wmain(int argc, wchar_t* argv[]) {
         SetTimer(overlay, previewTimer, 150, nullptr);
         windowSearch.initialize();
         MSG msg{};
+        WPARAM dismissedWith = 0;
         BOOL status;
         while ((status = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
+            // Consume the dismissing press before TranslateMessage can enqueue a character.
+            if (msg.hwnd == overlay && (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN)) {
+                const bool repeat = (msg.lParam & (1L << 30)) != 0;
+                if (helpVisible || (repeat && msg.wParam == dismissedWith)) {
+                    if (!repeat) {
+                        helpVisible = false;
+                        dismissedWith = msg.wParam;
+                        enterPressedHere = false;
+                        InvalidateRect(overlay, nullptr, FALSE);
+                    }
+                    continue;
+                }
+            }
+            if ((msg.message == WM_KEYUP || msg.message == WM_SYSKEYUP) && msg.wParam == dismissedWith)
+                dismissedWith = 0;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
