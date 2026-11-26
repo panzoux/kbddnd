@@ -32,6 +32,7 @@ using Microsoft::WRL::ComPtr;
 constexpr COLORREF transparentColor = RGB(255, 0, 255);
 constexpr wchar_t title[] = L"kbddnd";
 std::vector<std::wstring> paths;
+std::wstring fileSummary;
 std::vector<HWND> targets;
 size_t selected = 0;
 HWND overlay;
@@ -117,11 +118,85 @@ void chooseDirection(HWND root, int dx, int dy) {
     partIndex = next;
 }
 
+// Keep DWM content below the selector's GDI markers and above the dimmed desktop.
+struct WindowPreview {
+    HWND shade = nullptr;
+    HWND surface = nullptr;
+    HWND source = nullptr;
+    HTHUMBNAIL thumbnail = nullptr;
+    RECT bounds{};
+
+    void initialize(HINSTANCE instance, const RECT& desktop) {
+        DWORD style = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+        shade = CreateWindowExW(style | WS_EX_LAYERED | WS_EX_TRANSPARENT, L"STATIC", nullptr,
+            WS_POPUP | WS_DISABLED | SS_BLACKRECT, desktop.left, desktop.top,
+            desktop.right - desktop.left, desktop.bottom - desktop.top, nullptr, nullptr, instance, nullptr);
+        surface = CreateWindowExW(style, L"STATIC", nullptr, WS_POPUP | WS_DISABLED | SS_BLACKRECT,
+            0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+        if (shade && !SetLayeredWindowAttributes(shade, 0, 64, LWA_ALPHA)) {
+            DestroyWindow(shade);
+            shade = nullptr;
+        }
+    }
+
+    void hide() {
+        if (surface) ShowWindow(surface, SW_HIDE);
+        if (shade) ShowWindow(shade, SW_HIDE);
+        if (thumbnail) DwmUnregisterThumbnail(thumbnail);
+        thumbnail = nullptr;
+        source = nullptr;
+        bounds = {};
+    }
+
+    void update(HWND target) {
+        if (!shade || !surface) return;
+        RECT r{};
+        if (target && !GetWindowRect(target, &r)) target = nullptr;
+        if (target == source && EqualRect(&bounds, &r)) return;
+        if (target != source) {
+            hide();
+            source = target;
+            if (!target) return;
+            if (FAILED(DwmRegisterThumbnail(surface, target, &thumbnail))) {
+                bounds = r;
+                return;
+            }
+        }
+        bounds = r;
+        if (!thumbnail) return;
+        SIZE size{};
+        RECT frame{};
+        if (SUCCEEDED(DwmQueryThumbnailSourceSize(thumbnail, &size)) &&
+            SUCCEEDED(DwmGetWindowAttribute(target, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) &&
+            frame.right - frame.left == size.cx && frame.bottom - frame.top == size.cy)
+            r = frame;
+        const LONG width = r.right - r.left, height = r.bottom - r.top;
+        DWM_THUMBNAIL_PROPERTIES props{};
+        props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE;
+        props.rcDestination = {0, 0, width, height};
+        props.fVisible = TRUE;
+        if (FAILED(DwmUpdateThumbnailProperties(thumbnail, &props))) {
+            hide();
+            source = target;
+            GetWindowRect(target, &bounds);
+            return;
+        }
+        SetWindowPos(shade, overlay, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetWindowPos(surface, overlay, r.left, r.top, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    void destroy() {
+        hide();
+        if (surface) DestroyWindow(surface);
+        if (shade) DestroyWindow(shade);
+    }
+} preview;
+
 bool candidate(HWND w) {
     RECT r{};
     DWORD cloaked = 0;
     DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-    return w != overlay && w != GetShellWindow() && IsWindowVisible(w) &&
+    return w != overlay && w != preview.surface && w != preview.shade && w != GetShellWindow() && IsWindowVisible(w) &&
         !IsIconic(w) && !cloaked && IsWindowEnabled(w) &&
         GetWindowRect(w, &r) && !IsRectEmpty(&r) &&
         MonitorFromRect(&r, MONITOR_DEFAULTTONULL);
@@ -264,6 +339,7 @@ void refresh() {
 }
 
 void paint(HWND w) {
+    if (!dropping) preview.update(targets.empty() ? nullptr : targets[selected]);
     PAINTSTRUCT ps{};
     HDC dc = BeginPaint(w, &ps);
     RECT canvas{};
@@ -336,7 +412,7 @@ void paint(HWND w) {
     MapWindowPoints(nullptr, w, reinterpret_cast<POINT*>(&panel), 2);
     InflateRect(&panel, -16, -16);
     LONG bottom = panel.bottom;
-    panel.bottom = panel.top + 48 + (notice.empty() ? 0 : 32);
+    panel.bottom = panel.top + 48 + 32 + (notice.empty() ? 0 : 32);
     POINT marker{};
     if (!targets.empty() && aim(targets[selected], marker) && ScreenToClient(w, &marker) && PtInRect(&panel, marker))
         OffsetRect(&panel, 0, bottom - panel.bottom);
@@ -360,9 +436,17 @@ void paint(HWND w) {
     DrawTextW(dc, heading.c_str(), -1, &left, flags | DT_LEFT);
     DrawTextW(dc, label.c_str(), -1, &center, flags | DT_CENTER);
     DrawTextW(dc, keys, -1, &right, flags | DT_RIGHT);
+    RECT files = panel;
+    files.top = bar.bottom;
+    files.bottom = files.top + 32;
+    SetDCBrushColor(dc, RGB(224, 238, 248));
+    FillRect(dc, &files, fill);
+    InflateRect(&files, -8, 0);
+    SetTextColor(dc, RGB(18, 43, 64));
+    DrawTextW(dc, fileSummary.c_str(), -1, &files, flags | DT_LEFT);
     if (!notice.empty()) {
         RECT message = panel;
-        message.top = bar.bottom;
+        message.top = files.bottom;
         SetDCBrushColor(dc, RGB(255, 246, 190));
         FillRect(dc, &message, fill);
         InflateRect(&message, -8, 0);
@@ -510,6 +594,7 @@ std::wstring deliver(HWND target, POINT center, HWND expectedPart) {
 
 // Explorer can activate the taskbar during a drag or just after OLE unwinds.
 constexpr UINT_PTR focusTimer = 1;
+constexpr UINT_PTR previewTimer = 2;
 HWND rejectedTarget = nullptr;
 HWND taskbarPreview = nullptr;
 ULONGLONG restoreUntil = 0;
@@ -555,6 +640,18 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
     case WM_PAINT: paint(w); return 0;
     case WM_TIMER:
         if (key == focusTimer) restoreSelectorFocus(w);
+        if (key == previewTimer && !dropping && !targets.empty()) {
+            HWND target = targets[selected];
+            RECT r{};
+            if (!candidate(target)) {
+                mode = Mode::window;
+                parts.clear();
+                refresh();
+                InvalidateRect(w, nullptr, FALSE);
+            } else if (preview.surface && preview.shade && GetWindowRect(target, &r) && !EqualRect(&r, &preview.bounds)) {
+                InvalidateRect(w, nullptr, FALSE);
+            }
+        }
         return 0;
     case WM_KILLFOCUS:
         enterPressedHere = false;
@@ -594,10 +691,6 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
             mode = mode == Mode::position && !parts.empty() ? Mode::part : Mode::window;
         } else if (key == VK_TAB && mode == Mode::window && !targets.empty()) {
             HWND root = targets[selected];
-            // Reveal the target under the overlay while keeping keyboard focus.
-            SetWindowPos(root, HWND_TOP, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-            SetWindowPos(w, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             findParts(root);
             if (parts.empty()) {
                 RECT r{};
@@ -645,6 +738,7 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
             if (dropping || targets.empty()) return 0;
             KillTimer(w, focusTimer);
             dropping = true;
+            preview.hide();
             HWND target = targets[selected];
             POINT at{};
             bool valid = aim(target, at);
@@ -680,7 +774,7 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
             dropping = false;
         }
         return 0;
-    case WM_DESTROY: PostQuitMessage(0); return 0;
+    case WM_DESTROY: preview.destroy(); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(w, msg, key, lp);
 }
@@ -688,7 +782,7 @@ LRESULT CALLBACK procedure(HWND w, UINT msg, WPARAM key, LPARAM lp) {
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
-        return std::puts("kbddnd 0.3.3\nUsage: kbddnd.exe FILE [FILE ...]") == EOF ? 1 : 0;
+        return std::puts("kbddnd 0.4.0\nUsage: kbddnd.exe FILE [FILE ...]") == EOF ? 1 : 0;
     }
     FreeConsole();
     HINSTANCE instance = GetModuleHandleW(nullptr);
@@ -707,6 +801,12 @@ int wmain(int argc, wchar_t* argv[]) {
         MessageBoxW(nullptr, error.c_str(), title, MB_ICONINFORMATION);
         return 1;
     }
+    fileSummary = L"送信 (" + std::to_wstring(paths.size()) + L"件)";
+    for (const auto& value : paths) {
+        auto path = std::filesystem::path(value).lexically_normal();
+        if (!path.has_filename() && path != path.root_path()) path = path.parent_path();
+        fileSummary += L"　" + (path.has_filename() ? path.filename() : path).wstring();
+    }
     if (FAILED(OleInitialize(nullptr))) return 1;
     WNDCLASSW cls{};
     cls.hInstance = instance;
@@ -720,9 +820,13 @@ int wmain(int argc, wchar_t* argv[]) {
             GetSystemMetrics(SM_CYVIRTUALSCREEN), nullptr, nullptr, instance, nullptr);
     int result = 1;
     if (overlay && SetLayeredWindowAttributes(overlay, transparentColor, 220, LWA_COLORKEY | LWA_ALPHA)) {
+        RECT desktop{};
+        GetWindowRect(overlay, &desktop);
+        preview.initialize(instance, desktop);
         refresh();
         ShowWindow(overlay, SW_SHOW);
         SetForegroundWindow(overlay);
+        SetTimer(overlay, previewTimer, 150, nullptr);
         windowSearch.initialize();
         MSG msg{};
         BOOL status;
